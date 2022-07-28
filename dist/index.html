@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en" >
+<head>
+  <meta charset="UTF-8">
+  <title>CodePen - Perpetual Ball Drops</title>
+  <link rel="stylesheet" href="./style.css">
+
+</head>
+<body>
+<!-- partial:index.partial.html -->
+<!-- VertexShader code here -->
+<script id="vertexShader" type="x-shader/x-vertex">#version 300 es
+precision highp float;
+in vec4 vPosition;
+void main() {
+	gl_Position = vPosition;
+}
+</script>
+<!-- FragmentShader code here -->
+<script id="fragmentShader" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+out vec4 fragColor;
+  
+uniform vec4 mouse;
+uniform vec2 resolution;
+uniform float time;
+
+#define T 			time
+#define M				mouse
+#define R				resolution
+
+const float PI = acos(-1.0);
+const float min_dist = .001;
+const float max_dist = 50.;
+
+// util functions
+mat2 r2(float a) {return mat2(cos(a),sin(a),-sin(a),cos(a));}
+vec3 hue(float a){return .85 + .25*cos(PI * a * vec3(.25,1.25, .45));}
+
+float pMod(inout float p, float size) {
+    float halfsize = size*0.5;
+    float c = floor((p + halfsize)/size);
+    p = mod(p + halfsize, size) - halfsize;
+    return c;
+}
+void getMouse(inout vec3 ro) {
+    float x = M.xy == vec2(0) ? 0. : -(M.y/R.y * .5 - .25) * PI;
+    float y = M.xy == vec2(0) ? 0. : (M.x/R.x * .5 - .25) * PI;
+    ro.zy *=r2(x);
+    ro.xz *=r2(y);
+}
+
+//@iq sdf/extrusion formula.
+float sdCyl( vec3 p, float h, float r ) {
+  vec2 d = abs(vec2(length(p.xz),p.y)) - vec2(h,r);
+  return min(max(d.x,d.y),0.0) + length(max(d,0.0));
+}
+
+float sdRBox( in vec2 p, in vec2 b, in vec4 r ) {
+    r.xy = (p.x>0.0)?r.xy : r.zw;
+    r.x  = (p.y>0.0)?r.x  : r.y;
+    vec2 q = abs(p)-b+r.x;
+    return min(max(q.x,q.y),0.0) + length(max(q,0.0)) - r.x;
+}
+float opExtrusion(in float sdf, in float pz, in float h){
+    vec2 w = vec2( sdf, abs(pz) - h );
+  	return min(max(w.x, w.y), 0.) + length(max(w, 0.));
+}
+// Folding stuff for bars
+void cmx(inout vec4 p, float scale, float k1, float k2, float k3) {
+    vec3 cscale = vec3(k1, k2, k3);
+    if (p.x < p.y) p.xy = p.yx;
+    p.x = -p.x;
+    if (p.x > p.y) p.xy = p.yx;
+    p.x = -p.x;
+    if (p.x < p.z) p.xz = p.zx;
+    p.x = -p.x;
+    if (p.x > p.z) p.xz = p.zx;
+    p.x = -p.x;
+    
+    p.xyz = p.xyz*scale - (scale - 1.0)*cscale;
+    p.w *= abs(float(scale));
+}
+void tet(inout vec4 p, float k1, float k2, float k3, float k4) {
+    p = abs(p);
+    float k = (k1 - 0.5)*2.0;
+    p.xyz /= vec3(k2, k3, k4);
+
+    if (p.x < p.y) p.xy = p.yx; p.x = -p.x;
+    if (p.x > p.y) p.xy = p.yx; p.x = -p.x;
+    if (p.x < p.z) p.xz = p.zx; p.x = -p.x;
+    if (p.x > p.z) p.xz = p.zx; p.x = -p.x;
+
+    p.xyz = p.xyz*k1 - k + 1.0;
+    p.xyz *= vec3(k2, k3, k4);
+    p.w *= abs(k);
+}
+// scene map
+vec3 g_hitPoint, s_hitPoint;
+float g_hash, s_hash, frtm, fltm, trvltime, gid,sid;
+mat2 r45,r90,r91;
+
+vec2 platform(vec3 p, float m) {
+    vec2 res = vec2(100.,-1.);
+    float p1 = sdRBox(p.zy,vec2(.500,.10),vec4(.085));
+    float p2 = sdRBox(p.zy,vec2(.450,.05),vec4(.055));
+
+    float d1 = max(opExtrusion(p1, p.x, .75)-.01,-opExtrusion(p2, p.x, 1.));
+   
+    if(d1<res.x) res = vec2(d1,1.);
+
+    return res;
+}
+
+vec2 map(vec3 p) {
+    p.y+=trvltime;
+    
+	  vec2 res = vec2(100.,-1.);
+    vec3 p1 = p+vec3(0,1.05,-1.15);
+    vec3 p2 = p+vec3(0,0.05,.65);
+    vec3 s = p+vec3(0,-.15,-1.);;
+    
+    // planks
+    float pid1= pMod(p1.y,2.);
+    float pid2= pMod(p2.y,2.);
+    
+    vec3 b1 = p1;
+    
+    p1.zy*=r90;
+    p2.zy*=r91;
+    
+    vec2 d7 = platform(p1,pid1);
+    if(d7.x<res.x) {
+        res = d7;
+    	g_hitPoint=p1;
+    }
+    vec2 d8 = platform(p2,pid2);
+    if(d8.x<res.x) {
+        res = d8;
+    	g_hitPoint=p2;
+    }
+
+    //balls+motion
+    //bounce - I saw something about CoR's etc.. but taking that 
+    //into here I couldnt understand.. Plus time is a constant here
+    //so all the other math wasnt working.
+
+    float dy = abs(sqrt(2.*sin(frtm*PI)))/2. ;
+
+    s.y+=(frtm);//constant down motion
+    
+    vec3 bvec = s-vec3(0,dy,-1.4);
+    
+    float bid= pMod(bvec.y,1.);
+   
+   //back and forth hack..
+    float dz = 1.17*sqrt(frtm);
+    //i feel this is bad.. what am I doing - I dont know...
+    //I just made some things move every other mod... but
+    //that dz is just wrong? 
+    vec3 bmd = mod(bid,2.)<1.? vec3(0,0,0) : vec3(0,0,1.25);
+    bvec.z += (mod(fltm,1.)<1.&& mod(bid,2.)<1.) ? -dz : dz;
+    
+    float ball = length(bvec-bmd)-.425;
+    
+    if(ball<res.x) {
+        res = vec2(ball,6.);
+    	g_hitPoint=bvec;
+        gid=bid;
+    }    
+    
+    //bars
+    vec4 P = vec4(b1,1.);
+    tet(P, 1., .125, .25, .125);
+    cmx(P.zxyw, 1.5, 1., 1., .75);
+   
+    float b2 = sdCyl(P.xyz-vec3(.775,.0,.8), .05, .67)/P.w;
+    float b3 = sdCyl(P.yxz-vec3(.65,.0, .775), .05, 1.25)/P.w;
+    b2=min(b3,b2);
+    if(b2<res.x) {
+        res = vec2(b2*.65,5.);
+    	g_hitPoint=p;
+    }  
+    
+    return res;
+}
+
+vec2 raymarcher(vec3 ro, vec3 rd, int maxsteps){
+	float d = 0.;
+    float m = -1.;
+    for(int i=0;i<maxsteps;i++){
+    	vec2 t = map(ro + rd * d);
+        if(t.x<min_dist) break;
+        d += i<64 ? t.x*.45 : t.x * .95;
+        if(d>max_dist) break;
+        m  = t.y;
+    }
+	return vec2(d,m);
+}
+
+// Tetrahedron technique @iq
+// https://www.iquilezles.org/www/articles/normalsSDF/normalsSDF.htm
+vec3 getNormal(vec3 p, float t){
+    float h = t * min_dist;
+    #define ZERO (min(0,0))
+    vec3 n = vec3(0.0);
+    for(int i=ZERO; i<4; i++) {
+        vec3 e = 0.5773*(2.*vec3((((i+3)>>1)&1),((i>>1)&1),(i&1))-1.);
+        n += e*map(p+e*h).x;
+    }
+    return normalize(n);
+}
+
+float getDiff(in vec3 p, in vec3 n, in vec3 lpos) {
+    vec3 l = lpos-p;
+    vec3 lp = normalize(l);
+    float dif = clamp(dot(n,lp),0. , 1.),
+          shadow = raymarcher(p + n * min_dist * 2.,lp, 86).x;
+    if(shadow < length(l)) dif *= .2;
+    return dif;
+}
+
+vec3 getSpec(vec3 p, vec3 n, vec3 l, vec3 ro) {
+    vec3 view = normalize(p - ro);
+    vec3 ref = reflect(l, n);
+    float specValue = pow(max(dot(view, ref), 0.), 32.);
+    return vec3(0.) + 0.75 * specValue;
+}
+
+//@Shane AO
+float calcAO(in vec3 p, in vec3 n){
+    float sca = 2., occ = 0.;
+    for( int i = 0; i<4; i++ ){
+        float hr = float(i + 1)*.25/8.; 
+        float d = map(p + n* hr).x;
+        occ += (hr - d)*sca;
+        sca *= .95;
+        if(sca>1e5) break;
+    }
+    return clamp(1. - occ, 0., 1.);
+}
+
+float circle(vec2 pt, vec2 center, float r, float lw) {
+  float len = length(pt - center),
+        hlw = lw / 2.,
+        edge = .01;
+  return smoothstep(r-hlw-edge,r-hlw, len)-smoothstep(r+hlw,r+hlw+edge, len);
+}
+
+vec3 getCheck(vec3 pos){
+    vec2 dv = pos.xz*7.;
+    float cir = circle(fract(dv),vec2(0.5),.29,.06);
+    cir += circle(fract(dv),vec2(0.5),.45,.06);
+    cir += circle(fract(abs(dv)-.5),vec2(0.5),.14,.06);
+    return vec3(1.-cir);
+}
+
+// Tri-Planar blending function.
+vec3 getTex( in vec3 p, in vec3 n ) {  
+    n = max(n*n - .2, min_dist);
+    n /= dot(n, vec3(1)); 
+    vec3 ty = getCheck(p.xyz).xyz;
+    vec3 tx = 1.-getCheck(p.zxy).xyz;
+    vec3 tz = getCheck(p.yzx).xyz;
+    return mat3(tx*tx, ty*ty, tz*tz)*n;
+}
+
+vec3 getColor(float m,vec3 n) {   
+    vec3 h = vec3(1.);
+    if(m==1.) h = vec3(1.000,0.584,0.361)+getTex(s_hitPoint*.5,n).xyz;
+    if(m==3.) h = vec3(0.259,0.082,0.898);
+    if(m==5.) h = vec3(1.000,0.839,0.941);
+    if(m==6.) h = hue(mod(sid+floor(time),6.)*.78);
+    return h;
+}
+
+vec3 camera(vec3 lp, vec3 ro, vec2 uv) {
+	vec3 cf = normalize(lp - ro),
+         cr = normalize(cross(vec3(0,1,0),cf)),
+         cu = normalize(cross(cf,cr)),
+         c  = ro + cf *.95,
+         i  = c + uv.x * cr + uv.y * cu,
+         rd = i - ro;
+    return rd;
+}
+
+void main(){
+    frtm = fract((time)*1.);
+    fltm = floor(time);
+    trvltime = -time*.25;
+    r90=r2(15.*PI/180.);
+    r91=r2(-15.*PI/180.);
+    vec2 uv = (2.* gl_FragCoord.xy-R.xy)/max(R.x,R.y);
+
+    vec3 C = vec3(0.),
+         FC= vec3(0.996,0.565,0.714);
+    
+    vec3 lp = vec3(0,.15,0),
+         ro = vec3(0,.15,-3.45);
+	
+    // the spin - cam motion
+    ro.xz*=r2(time*.235);
+
+    // mouse pan
+    getMouse(ro);
+    
+    vec3 rd = camera(lp, ro, uv);
+    vec2 t = raymarcher(ro,rd, 192);
+    s_hitPoint=g_hitPoint;
+    s_hash=g_hash;
+    sid=gid;
+    if(t.x<max_dist){
+		vec3 p = ro + rd * t.x;
+      	vec3 n = getNormal(p, t.x);
+        
+        vec3 h = getColor(t.y,n);
+        
+        vec3 lpos = vec3(-4.5,5.5,3.5);
+        vec3 ll = normalize(lpos);   
+        vec3 spec = getSpec(p,n,ll,ro);
+
+        float diff = getDiff(p,n,lpos);
+        float ao = calcAO(p,n);
+
+        C += h * (diff + spec) * ao;
+
+        if(t.y!=1.){
+        	vec3 rr=reflect(rd,n); 
+            vec2 tr = raymarcher(p+(n*min_dist),rr, 92);
+            s_hitPoint=g_hitPoint;
+            s_hash=g_hash;
+            sid=gid;
+            if(tr.x<max_dist){
+                p += rr*tr.x;
+                n = getNormal(p,tr.x);
+                
+				h = getColor(tr.y, n);
+            	diff = getDiff(p,n,lpos);
+            	spec = getSpec(p,n,ll,ro);
+                
+                C += (h * diff + spec) * .5;
+
+            }
+        }
+    }
+  
+  
+	  C = mix( FC,C,  exp(-.0085*t.x*t.x*t.x));
+    fragColor = vec4(C,1.0);
+}
+
+</script>
+<div id="container" />
+<!-- partial -->
+  <script  src="./script.js"></script>
+
+</body>
+</html>
